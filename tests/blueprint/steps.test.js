@@ -51,6 +51,7 @@ describe("step registry", () => {
       "installTheme",
       "installLanguagePack",
       "restoreCourse",
+      "restoreDatabase",
       "mkdir",
       "rmdir",
       "writeFile",
