@@ -102,9 +102,14 @@ const MIME_TYPES = {
   js: "application/javascript; charset=utf-8",
   json: "application/json; charset=utf-8",
   map: "application/json; charset=utf-8",
+  // Browsers refuse to run a JavaScript module with any other type. PDF.js
+  // (coursework's annotation viewer) loads its code as .mjs.
+  mjs: "application/javascript; charset=utf-8",
   png: "image/png",
   svg: "image/svg+xml",
   txt: "text/plain; charset=utf-8",
+  // WebAssembly.instantiateStreaming() refuses any other type.
+  wasm: "application/wasm",
   webp: "image/webp",
   woff: "font/woff",
   woff2: "font/woff2",
@@ -313,6 +318,7 @@ function removeMemfsTree(FS, path) {
 
 export const __testing = {
   encodeHeaderValue,
+  getMimeType,
   isPhpExecutionFailure,
   phpResponseToResponse,
   shouldPassThroughFailedPhpResponse,
