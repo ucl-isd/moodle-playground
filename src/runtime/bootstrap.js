@@ -2280,6 +2280,15 @@ async function runConfigNormalizer(php, webRoot) {
   return jsonPayload ? JSON.parse(jsonPayload) : {};
 }
 
+async function isFolder(php, path) {
+  try {
+    const about = await php.analyzePath(path);
+    return Boolean(about?.exists && about.object?.isFolder);
+  } catch {
+    return false;
+  }
+}
+
 async function runThemeCssWarmup(php, webRoot) {
   const output = await requestRuntimeScript(
     php,
@@ -2925,8 +2934,13 @@ export async function bootstrapMoodle({
   // triggered lazily on the first HTTP request.  Warming the cache here
   // (during the loading screen) avoids that runtime crash.
   // Skipped when the localcache seed already provided the candidate sheets
-  // compiled at build time (1-3s of scssphp work saved per boot).
-  if (localcacheSeeded) {
+  // compiled at build time (1-3s of scssphp work saved per boot). The seed of
+  // a prebuilt (exported) database can lack theme/, so check the folder, not
+  // only that a seed was applied.
+  const themeSeeded =
+    localcacheSeeded &&
+    (await isFolder(php, `${MOODLEDATA_ROOT}/localcache/theme`));
+  if (themeSeeded) {
     publish(
       "Theme CSS pre-compiled at build time — skipping SCSS warmup.",
       0.925,

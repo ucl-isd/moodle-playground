@@ -77,8 +77,11 @@ function makePhp({ run = {}, request = {}, files = {} } = {}) {
     "SELECT value FROM mdl_config WHERE name = 'playground_blueprint_checkpoint'":
       () => "null",
     "'playground_blueprint_checkpoint', :value": () => "checkpoint-saved",
-    "moodle-localcache-seed.zip": () =>
-      `notice\n${json({ ok: true, entries: 3, rewritten: 1 })}`,
+    // A real seed unpacks its compiled theme CSS into localcache/theme.
+    "moodle-localcache-seed.zip": () => {
+      dirs.add("/persist/moodledata/localcache/theme");
+      return `notice\n${json({ ok: true, entries: 3, rewritten: 1 })}`;
+    },
     "set_config('lang'": () =>
       json({ ok: true, lang: "es", action: "applied", previous: "en" }),
     lang_installer: () => json({ ok: true, lang: "en", action: "skipped" }),
@@ -331,6 +334,46 @@ describe("bootstrapMoodle", () => {
       assert.match(dec(php.fs.get("/www/moodle/config.php")), /MY_FLAG/);
       assert.equal(result.readyPath, "/course/view.php?id=2");
       assert.ok(has(log, /Blueprint persistence flush: \d+ms, 5 bytes, 2 ops/));
+    } finally {
+      restore();
+    }
+  });
+
+  it("runs the SCSS warmup when the seed has no theme CSS", async () => {
+    const restore = mockFetch({
+      "https://cdn.test/install.sq3": new Uint8Array(200).fill(7),
+      "https://cdn.test/localcache.zip": new Uint8Array([1, 2, 3]),
+    });
+    try {
+      let warmups = 0;
+      const php = makePhp({
+        // A seed from a prebuilt database: DI and RequireJS, no theme/.
+        run: {
+          "moodle-localcache-seed.zip": () =>
+            json({ ok: true, entries: 2, rewritten: 0 }),
+        },
+        request: {
+          "/__theme_css_warmup.php": () => {
+            warmups++;
+            return json({ ok: true, size: 10, rev: 7 });
+          },
+        },
+      });
+      php.flushPersistence = async () => ({ ok: true });
+      const { log } = await boot(php, {
+        archivePromise: Promise.resolve(
+          makeArchive({
+            snapshot: {
+              url: "https://cdn.test/install.sq3",
+              localcache: { url: "https://cdn.test/localcache.zip" },
+            },
+          }),
+        ),
+      });
+      assert.ok(has(log, /Localcache seed applied \(2 entries/));
+      assert.equal(warmups, 1);
+      assert.ok(!has(log, /skipping SCSS warmup/));
+      assert.ok(has(log, /Theme CSS compiled and cached/));
     } finally {
       restore();
     }
