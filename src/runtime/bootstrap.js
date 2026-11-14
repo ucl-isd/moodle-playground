@@ -3072,7 +3072,11 @@ export async function bootstrapMoodle({
       }
       if (!result.success) {
         publish(
-          `Blueprint failed at step ${result.failedStep}: ${result.error}`,
+          `Blueprint failed at step ${result.failedStep}: ${result.error}${
+            result.earlierFailure
+              ? ` (earlier failure at step ${result.earlierFailure.failedStep}: ${result.earlierFailure.error})`
+              : ""
+          }`,
           0.95,
         );
       }
