@@ -417,6 +417,60 @@ describe("sw.js fetch routing", () => {
     assert.equal(await response.text(), "fresh-2");
   });
 
+  // What fetch() gives the service worker for a page load that a private
+  // Pages site redirects to its sign-in (a navigation's redirect mode is
+  // "manual"). Node cannot build a real one.
+  const signInRedirect = () => ({
+    type: "opaqueredirect",
+    ok: false,
+    status: 0,
+  });
+
+  for (const [path, destination] of [
+    ["/", "document"],
+    ["/index.html", "document"],
+    ["/remote.html", "iframe"],
+  ]) {
+    it(`passes a sign-in redirect for ${path} to the browser, not the saved page`, async () => {
+      const url = `${BASE}${path}`;
+      fetchImpl = async () => new Response("saved page");
+      await dispatchFetch(
+        makeRequest(url, {}, { mode: "navigate", destination }),
+      );
+
+      const redirect = signInRedirect();
+      fetchImpl = async () => redirect;
+      const { response } = await dispatchFetch(
+        makeRequest(url, {}, { mode: "navigate", destination }),
+      );
+      assert.equal(response, redirect);
+
+      // The saved page is kept for when the site is reachable again.
+      const cache = await caches.open(STATIC_CACHE);
+      assert.equal(await (await cache.match(url)).text(), "saved page");
+    });
+  }
+
+  it("still serves the saved page when a page load gets an error", async () => {
+    const url = `${BASE}/index.html`;
+    const navigation = () =>
+      makeRequest(url, {}, { mode: "navigate", destination: "document" });
+    fetchImpl = async () => new Response("saved page");
+    await dispatchFetch(navigation());
+    fetchImpl = async () => new Response("down", { status: 503 });
+    const { response } = await dispatchFetch(navigation());
+    assert.equal(await response.text(), "saved page");
+  });
+
+  it("serves the saved file when a redirect answers a request that is not a page load", async () => {
+    const url = `${BASE}/playground.config.json`;
+    fetchImpl = async () => new Response("saved config");
+    await dispatchFetch(makeRequest(url));
+    fetchImpl = async () => signInRedirect();
+    const { response } = await dispatchFetch(makeRequest(url));
+    assert.equal(await response.text(), "saved config");
+  });
+
   it("renders the error page when an uncached static file is unreachable", async () => {
     fetchImpl = async () => {
       throw new TypeError("offline");
