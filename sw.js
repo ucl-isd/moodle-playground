@@ -126,6 +126,13 @@ async function networkFirstStaticFetch(request, waitUntil) {
 
   try {
     const response = await fetch(buildFreshRequest(request));
+    // A private Pages site answers a page load with a redirect to sign-in once
+    // the sign-in has lapsed. Pass that redirect to the browser instead of
+    // showing the saved page, which cannot load its files. This covers the
+    // outer page and the playground frame, both of which are navigations.
+    if (response.type === "opaqueredirect" && request.mode === "navigate") {
+      return response;
+    }
     if (!response.ok && cached) {
       return cached;
     }
