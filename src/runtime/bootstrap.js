@@ -2289,6 +2289,26 @@ async function isFolder(php, path) {
   }
 }
 
+const SETUP_FAILURE_MAX_LENGTH = 300;
+
+/**
+ * The line of an error that says why, for the red bar. A failed Moodle upgrade
+ * reports every line Moodle printed, successes included, so pick Moodle's own
+ * error line when there is one. The full error stays in the log.
+ */
+export function summariseError(error) {
+  const text = String(error ?? "");
+  const reason =
+    text.match(/!!!\s*(.+?)\s*!!!/s)?.[1] ||
+    text.match(/Default exception handler:\s*(.+?)(?:\s+Debug:|\n|$)/)?.[1] ||
+    text.match(/Coding error detected[^\n]*/)?.[0] ||
+    text.split("=== Stdout ===")[0].split("\n")[0];
+  const line = reason.replace(/\s+/g, " ").trim() || text.trim();
+  return line.length > SETUP_FAILURE_MAX_LENGTH
+    ? `${line.slice(0, SETUP_FAILURE_MAX_LENGTH - 1)}…`
+    : line;
+}
+
 // The marked part of Moodle's "additional HTML, top of body" setting that the
 // playground owns. Anything else in the setting is left alone.
 const SETUP_FAILURE_START = "<!-- playground-setup-failure -->";
@@ -3147,7 +3167,7 @@ export async function bootstrapMoodle({
           }`,
           0.95,
         );
-        setupFailure = `the setup failed at step ${result.failedStep}: ${result.error}`;
+        setupFailure = `the setup failed at step ${result.failedStep}: ${summariseError(result.error)}`;
       } else if (config?.strictSetupChecks === true && checkpoint.legacy) {
         setupFailure =
           "this site was saved by an older playground, so its setup was not restored. Use Reset Playground to start again.";
@@ -3177,7 +3197,7 @@ export async function bootstrapMoodle({
       }
     } catch (blueprintError) {
       publish(`Blueprint execution error: ${blueprintError.message}`, 0.95);
-      setupFailure = `the setup could not run: ${blueprintError.message}`;
+      setupFailure = `the setup could not run: ${summariseError(blueprintError.message)}`;
     }
     await showSetupFailure(php, setupFailure, publish);
   }
