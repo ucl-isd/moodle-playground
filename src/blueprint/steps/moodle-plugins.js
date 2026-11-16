@@ -338,6 +338,7 @@ async function checkArchiveDrift(
     previouslyCompleted,
     component,
     installedVersion,
+    config,
   },
 ) {
   if (!checkpoint?.archives || !Number.isInteger(stepIndex)) return {};
@@ -368,12 +369,14 @@ async function checkArchiveDrift(
     installedVersion !== undefined &&
     Number(archiveVersion) > Number(installedVersion);
   if (!newer) {
-    publish?.(
+    const message =
       `Plugin ${component}: the archive at ${zipUrl} changed since it was installed ` +
-        `(archive version ${archiveVersion ?? "unknown"}, installed ${installedVersion ?? "unknown"}). ` +
-        "Not extracting it; Reset Playground to install the current archive.",
-      0.935,
-    );
+      `(archive version ${archiveVersion ?? "unknown"}, installed ${installedVersion ?? "unknown"}). ` +
+      "Not extracting it; Reset Playground to install the current archive.";
+    // With strictSetupChecks the site must match its setup, and it now runs
+    // without this plugin's code, so the step fails instead of skipping.
+    if (config?.strictSetupChecks === true) throw new Error(message);
+    publish?.(message, 0.935);
     return { skipped: true };
   }
   publish?.(
