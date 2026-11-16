@@ -1,0 +1,71 @@
+name: UCL tests
+
+# Lint, unit tests and the SQLite tests, on every push and pull request.
+# Also called by ucl-release.yml before it publishes anything.
+
+on:
+  push:
+    branches: ["**"] # not tags: a release tag runs these through ucl-release.yml
+  pull_request:
+    branches: ["main"]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ucl-test-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate build metadata
+        run: npm run build:version
+
+      # Bundling resolves every import the worker and the service worker reach,
+      # which the unit tests (importing sources directly) cannot.
+      - name: Build the worker
+        run: npm run build-worker
+
+      - name: Unit tests
+        run: make test
+
+      - name: Lint
+        run: make lint
+
+  sqlite:
+    name: SQLite table changes (Moodle 4.5)
+    runs-on: ubuntu-latest
+    env:
+      MOODLE_REF: v4.5.16
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: "8.3"
+          extensions: pdo_sqlite, sqlite3, intl, gd
+
+      - name: Fetch and patch Moodle
+        id: moodle
+        run: |
+          set -euo pipefail
+          source_dir=$(GIT_REF="$MOODLE_REF" scripts/fetch-moodle-source.sh MOODLE_405_STABLE)
+          sh scripts/patch-moodle-source.sh "$source_dir"
+          echo "dir=$source_dir" >> "$GITHUB_OUTPUT"
+
+      - name: SQLite tests
+        run: php tests/php/sqlite-ddl.test.php "${{ steps.moodle.outputs.dir }}"
