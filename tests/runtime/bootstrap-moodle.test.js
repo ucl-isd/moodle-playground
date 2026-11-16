@@ -5,6 +5,7 @@ import { createUstarTar } from "../../scripts/lib/tar-ustar.mjs";
 import {
   bootstrapMoodle,
   startArchiveResolution,
+  summariseError,
 } from "../../src/runtime/bootstrap.js";
 
 const enc = (s) => new TextEncoder().encode(s);
@@ -206,6 +207,60 @@ function reloadPhp(stored) {
     },
   });
 }
+
+// The red bar shows one line of an error; the log keeps all of it.
+describe("summariseError", () => {
+  it("picks Moodle's command-line error line", () => {
+    assert.equal(
+      summariseError(
+        "PHP.run() failed with exit code 1. === Stdout === -->editor_atto\n++ Success ++\n" +
+          "!!! Cannot downgrade mod_coursework from 2026081103 to 2026070600. !!!\n!! Stack trace !!",
+      ),
+      "Cannot downgrade mod_coursework from 2026081103 to 2026070600.",
+    );
+  });
+
+  it("picks the exception handler's message, without its debug part", () => {
+    assert.equal(
+      summariseError(
+        "PHP.run() failed with exit code 255. === Stderr === Default exception handler: " +
+          "Coding error detected, it must be fixed by a programmer: Invalid field Debug: more\n* line 308",
+      ),
+      "Coding error detected, it must be fixed by a programmer: Invalid field",
+    );
+  });
+
+  it("picks a coding error line on its own", () => {
+    assert.equal(
+      summariseError(
+        "noise\nCoding error detected, it must be fixed by a programmer: x\nmore",
+      ),
+      "Coding error detected, it must be fixed by a programmer: x",
+    );
+  });
+
+  it("drops the output dump of an error with no Moodle error line", () => {
+    assert.equal(
+      summariseError(
+        "PHP.run() failed with exit code 1. === Stdout === lots of output",
+      ),
+      "PHP.run() failed with exit code 1.",
+    );
+  });
+
+  it("leaves a short message as it is", () => {
+    assert.equal(
+      summariseError("setLandingPage: 'path' is required."),
+      "setLandingPage: 'path' is required.",
+    );
+  });
+
+  it("caps the length at 300 characters", () => {
+    const line = summariseError("x".repeat(500));
+    assert.equal(line.length, 300);
+    assert.ok(line.endsWith("…"));
+  });
+});
 
 describe("bootstrapMoodle", () => {
   it("installs a fresh site through the CLI stages, patches core and auto-logs in", async () => {
@@ -612,6 +667,64 @@ describe("bootstrapMoodle", () => {
       assert.match(
         setupBar(php),
         /^the setup could not run: Blueprint checkpoint could not be saved/,
+      );
+    });
+
+    it("shows the useful line of a long error, not the whole output", async () => {
+      // What the PHP runner throws when Moodle's upgrade refuses a downgrade.
+      const upgradeOutput =
+        "PHP.run() failed with exit code 1. === Stdout === -->editor_atto\n" +
+        "++ Success (0.02 seconds) ++\n" +
+        "!!! Cannot downgrade mod_coursework from 2026081103 to 2026070600. !!!\n" +
+        "Error code: cannotdowngrade";
+      const php = makePhp({
+        run: {
+          "UPGRADE-REFUSED": () => {
+            throw new Error(upgradeOutput);
+          },
+        },
+      });
+      const { log } = await boot(php, {
+        blueprint: {
+          steps: [{ step: "runPhpCode", code: "<?php // UPGRADE-REFUSED" }],
+        },
+      });
+      assert.equal(
+        setupBar(php),
+        "the setup failed at step 1:runPhpCode: Cannot downgrade mod_coursework from 2026081103 to 2026070600.",
+      );
+      // The log keeps the whole error.
+      assert.ok(
+        has(
+          log,
+          /Blueprint failed at step 1:runPhpCode: PHP\.run\(\) failed .*editor_atto/s,
+        ),
+      );
+    });
+
+    it("shows the useful line when the setup cannot run at all", async () => {
+      // On a reload the checkpoint lookup runs inside the setup; here it fails.
+      const php = reloadPhp(null);
+      const lookup =
+        "SELECT value FROM mdl_config WHERE name = 'playground_blueprint_checkpoint'";
+      const original = php.run;
+      php.run = async (code) => {
+        if (
+          code.includes(lookup) &&
+          !code.includes("playground-setup-failure")
+        ) {
+          throw new Error(
+            "PHP.run() failed with exit code 255. === Stdout === a\nb\n!!! Database is locked !!!\nmore",
+          );
+        }
+        return original(code);
+      };
+      await boot(php, {
+        blueprint: { steps: [{ step: "setLandingPage", path: "/my/" }] },
+      });
+      assert.equal(
+        setupBar(php),
+        "the setup could not run: Database is locked",
       );
     });
 
