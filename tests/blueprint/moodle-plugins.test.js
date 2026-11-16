@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { after, before, describe, it } from "node:test";
-import { strToU8, zipSync } from "fflate";
+import { strToU8, unzipSync, zipSync } from "fflate";
 import { getStepHandler } from "../../src/blueprint/steps/index.js";
 import { __testables } from "../../src/blueprint/steps/moodle-plugins.js";
 
@@ -107,6 +107,19 @@ function decodeBase64Bytes(base64) {
 }
 
 const sha256Hex = (bytes) => createHash("sha256").update(bytes).digest("hex");
+// What the checkpoint stores for an archive: a hash of its files, not of its
+// bytes. One "path<TAB>sha256" line per file, without the top-level folder,
+// sorted, joined by newlines.
+const contentHash = (zip) => {
+  const lines = Object.entries(unzipSync(zip))
+    .filter(([path]) => !path.endsWith("/"))
+    .map(
+      ([path, data]) =>
+        `${path.slice(path.indexOf("/") + 1)}\t${sha256Hex(data)}`,
+    )
+    .sort();
+  return sha256Hex(strToU8(lines.join("\n")));
+};
 const pluginZip = (version, extra = {}) =>
   zipSync({
     "plugin-main/version.php": strToU8(`<?php $plugin->version = ${version};`),
@@ -193,12 +206,12 @@ it("records the archive hash on first install so the checkpoint can verify reloa
       },
     }),
   );
-  assert.deepEqual([...archives], [[2, sha256Hex(zip)]]);
+  assert.deepEqual([...archives], [[2, contentHash(zip)]]);
 });
 
 it("reload with the same archive restores it without warnings", async () => {
   const zip = pluginZip(2026101600);
-  const fixture = reloadContext({ archives: new Map([[3, sha256Hex(zip)]]) });
+  const fixture = reloadContext({ archives: new Map([[3, contentHash(zip)]]) });
   await serving(zip, () =>
     getStepHandler("installMoodlePlugin")(STEP, fixture.context),
   );
@@ -216,7 +229,7 @@ it("reload with a changed archive but no newer version warns and does not extrac
   const installed = pluginZip(2026101600);
   const changed = pluginZip(2026101600, { "lib.php": "<?php // edited" });
   const fixture = reloadContext({
-    archives: new Map([[3, sha256Hex(installed)]]),
+    archives: new Map([[3, contentHash(installed)]]),
   });
   const result = await (async () => {
     let value;
@@ -241,7 +254,7 @@ it("reload with a changed archive but no newer version warns and does not extrac
 it("reload with an older archive than the persisted DB warns and does not extract it", async () => {
   const older = pluginZip(2026101500);
   const fixture = reloadContext({
-    archives: new Map([[3, sha256Hex(pluginZip(2026101600))]]),
+    archives: new Map([[3, contentHash(pluginZip(2026101600))]]),
   });
   await serving(older, () =>
     getStepHandler("installMoodlePlugin")(STEP, fixture.context),
@@ -252,7 +265,7 @@ it("reload with an older archive than the persisted DB warns and does not extrac
 
 it("reload with a newer archive installs it, warns and makes Moodle ask for the upgrade", async () => {
   const newer = pluginZip(2026101601);
-  const archives = new Map([[3, sha256Hex(pluginZip(2026101600))]]);
+  const archives = new Map([[3, contentHash(pluginZip(2026101600))]]);
   const fixture = reloadContext({ archives });
   await serving(newer, () =>
     getStepHandler("installMoodlePlugin")(STEP, fixture.context),
@@ -266,7 +279,7 @@ it("reload with a newer archive installs it, warns and makes Moodle ask for the 
   assert.match(restoreCode, /set_config\('allversionshash', ''\)/);
   assert.doesNotMatch(restoreCode, /upgrade_noncore/);
   assert.equal(fixture.saves(), 1, "the accepted archive hash is persisted");
-  assert.equal(archives.get(3), sha256Hex(newer));
+  assert.equal(archives.get(3), contentHash(newer));
 });
 
 it("reload with a checkpoint that predates archive hashes adopts the current archive", async () => {
@@ -278,8 +291,62 @@ it("reload with a checkpoint that predates archive hashes adopts the current arc
   );
   assert.ok(fixture.files.includes("/www/moodle/local/drift/version.php"));
   assert.equal(fixture.saves(), 1);
-  assert.equal(archives.get(3), sha256Hex(zip));
+  assert.equal(archives.get(3), contentHash(zip));
   assert.ok(!fixture.messages.some((m) => /changed|newer/.test(m)));
+});
+
+it("reload with the same files in different bytes restores it without warnings", async () => {
+  // The same code rebuilt: another top-level folder name, the files in the
+  // other order (not sorted) and no compression, so the bytes differ.
+  const installed = zipSync({
+    "plugin-main/lib.php": strToU8("<?php // lib"),
+    "plugin-main/version.php": strToU8("<?php $plugin->version = 2026101600;"),
+  });
+  const rebuilt = zipSync(
+    {
+      "plugin-0123abc/version.php": strToU8(
+        "<?php $plugin->version = 2026101600;",
+      ),
+      "plugin-0123abc/lib.php": strToU8("<?php // lib"),
+    },
+    { level: 0 },
+  );
+  assert.notEqual(sha256Hex(rebuilt), sha256Hex(installed));
+  const archives = new Map([[3, contentHash(installed)]]);
+  const fixture = reloadContext({ archives });
+  await serving(rebuilt, () =>
+    getStepHandler("installMoodlePlugin")(STEP, fixture.context),
+  );
+  assert.ok(fixture.files.includes("/www/moodle/local/drift/version.php"));
+  assert.ok(!fixture.messages.some((m) => /changed|newer/.test(m)));
+  assert.equal(fixture.saves(), 0);
+  assert.equal(archives.get(3), contentHash(installed));
+});
+
+it("reload with a byte hash from an older checkpoint accepts it once and stores the contents hash", async () => {
+  const zip = pluginZip(2026101600);
+  const archives = new Map([[3, sha256Hex(zip)]]);
+  const fixture = reloadContext({ archives });
+  await serving(zip, () =>
+    getStepHandler("installMoodlePlugin")(STEP, fixture.context),
+  );
+  assert.ok(fixture.files.includes("/www/moodle/local/drift/version.php"));
+  assert.ok(!fixture.messages.some((m) => /changed|newer/.test(m)));
+  assert.equal(fixture.saves(), 1);
+  assert.equal(archives.get(3), contentHash(zip));
+});
+
+it("reload with a file renamed but the same data still counts as changed", async () => {
+  const installed = pluginZip(2026101600, { "lib.php": "<?php // lib" });
+  const renamed = pluginZip(2026101600, { "locallib.php": "<?php // lib" });
+  const fixture = reloadContext({
+    archives: new Map([[3, contentHash(installed)]]),
+  });
+  await serving(renamed, () =>
+    getStepHandler("installMoodlePlugin")(STEP, fixture.context),
+  );
+  assert.deepEqual(fixture.files, []);
+  assert.ok(fixture.messages.some((m) => /changed since/.test(m)));
 });
 
 it("retries a thrown download error and then installs", async () => {
