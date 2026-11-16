@@ -351,6 +351,80 @@ describe("executeBlueprint", () => {
     assert.strictEqual(result.timings.length, 2);
   });
 
+  // The step that stopped the blueprint is named, not the first
+  // failure, which may be an earlier non-critical step.
+  it("names the critical step that halted, and keeps the earlier failure", async () => {
+    const php = createMockPhp();
+    const result = await executeBlueprint(
+      {
+        steps: [
+          { step: "installMoodle" },
+          { step: "createUser" }, // missing username -> throws (non-critical)
+          { step: "setLandingPage", critical: true }, // missing path -> halt
+          { step: "setLandingPage", path: "/after/" },
+        ],
+      },
+      { php, publish: () => {} },
+    );
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.failedStep, "3:setLandingPage");
+    assert.match(result.error, /'path' is required/u);
+    assert.strictEqual(result.earlierFailure.failedStep, "2:createUser");
+    assert.strictEqual(result.landingPage, null);
+    assert.strictEqual(result.timings.length, 3);
+  });
+
+  it("has no earlier failure when the critical step is the first to fail", async () => {
+    const php = createMockPhp();
+    const result = await executeBlueprint(
+      {
+        steps: [
+          { step: "installMoodle" },
+          { step: "createUser", critical: true },
+        ],
+      },
+      { php, publish: () => {} },
+    );
+    assert.strictEqual(result.failedStep, "2:createUser");
+    assert.strictEqual("earlierFailure" in result, false);
+  });
+
+  it("still names the first failure when no step is critical", async () => {
+    const php = createMockPhp();
+    const result = await executeBlueprint(
+      {
+        steps: [
+          { step: "createUser" },
+          { step: "setLandingPage" },
+          { step: "setLandingPage", path: "/after/" },
+        ],
+      },
+      { php, publish: () => {} },
+    );
+    assert.strictEqual(result.failedStep, "1:createUser");
+    assert.strictEqual("earlierFailure" in result, false);
+    assert.strictEqual(result.landingPage, "/after/");
+  });
+
+  it("names a critical unknown step that halted, and keeps the earlier failure", async () => {
+    const php = createMockPhp();
+    const result = await executeBlueprint(
+      {
+        steps: [
+          { step: "createUser" },
+          { step: "nonExistentStep", critical: true },
+          { step: "setLandingPage", path: "/after/" },
+        ],
+      },
+      { php, publish: () => {} },
+    );
+    assert.strictEqual(result.failedStep, "2:nonExistentStep");
+    assert.strictEqual(result.error, "Unknown step type: nonExistentStep");
+    assert.strictEqual(result.earlierFailure.failedStep, "1:createUser");
+    assert.strictEqual(result.landingPage, null);
+  });
+
   it("continues past an unknown step type (non-fatal) and runs later steps", async () => {
     const php = createMockPhp();
     const result = await executeBlueprint(

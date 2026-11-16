@@ -124,12 +124,11 @@ export async function executeBlueprint(blueprint, context) {
       recordTiming(i + 1, stepName, label, startMs, "failed");
       const error = `Unknown step type: ${stepName}`;
       publish(`Blueprint step ${stepName} skipped: ${error}`, progress);
-      if (!firstFailure) {
-        firstFailure = { failedStep: `${i + 1}:${stepName}`, error };
-      }
+      const failure = { failedStep: `${i + 1}:${stepName}`, error };
       if (step.critical) {
-        return { success: false, landingPage, ...firstFailure, timings };
+        return abortResult(failure, firstFailure, landingPage, timings);
       }
+      firstFailure ||= failure;
       continue;
     }
 
@@ -163,16 +162,15 @@ export async function executeBlueprint(blueprint, context) {
       recordTiming(i + 1, stepName, label, startMs, "failed");
       const message = error?.message || String(error);
       publish(`Blueprint step ${stepName} failed: ${message}`, progress);
-      if (!firstFailure) {
-        firstFailure = { failedStep: `${i + 1}:${stepName}`, error: message };
-      }
+      const failure = { failedStep: `${i + 1}:${stepName}`, error: message };
       // Non-fatal by default (ADR-0005): keep provisioning the remaining steps
       // so one transient failure (e.g. a resource download) does not discard
       // the whole playground. `critical: true` opts a step into aborting —
       // except on reload, where nothing mutates and login/landing must still run.
       if (step.critical && !checkpoint?.resuming) {
-        return { success: false, landingPage, ...firstFailure, timings };
+        return abortResult(failure, firstFailure, landingPage, timings);
       }
+      firstFailure ||= failure;
       continue;
     }
     // Checkpoint failures must abort, not be treated as an optional step error.
@@ -183,6 +181,21 @@ export async function executeBlueprint(blueprint, context) {
     success: !firstFailure,
     landingPage,
     ...(firstFailure || {}),
+    timings,
+  };
+}
+
+/**
+ * The result of a critical step stopping the blueprint. It names that step,
+ * not the first failure, which would point at an earlier non-critical step.
+ * An earlier failure is kept as earlierFailure.
+ */
+function abortResult(failure, firstFailure, landingPage, timings) {
+  return {
+    success: false,
+    landingPage,
+    ...failure,
+    ...(firstFailure ? { earlierFailure: firstFailure } : {}),
     timings,
   };
 }
