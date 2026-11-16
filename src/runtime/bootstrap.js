@@ -2280,6 +2280,52 @@ async function runConfigNormalizer(php, webRoot) {
   return jsonPayload ? JSON.parse(jsonPayload) : {};
 }
 
+// The marked part of Moodle's "additional HTML, top of body" setting that the
+// playground owns. Anything else in the setting is left alone.
+const SETUP_FAILURE_START = "<!-- playground-setup-failure -->";
+const SETUP_FAILURE_END = "<!-- /playground-setup-failure -->";
+
+/**
+ * Show a failed setup on every Moodle page, as a red bar pinned to the bottom
+ * of the window, or remove the bar when the setup succeeded. The setting is in
+ * the database, so the bar survives a reload until a boot succeeds.
+ */
+export function buildSetupFailurePhp(failure) {
+  return `<?php
+define('CLI_SCRIPT', true);
+require_once('${MOODLE_ROOT}/config.php');
+$start = '${SETUP_FAILURE_START}';
+$end = '${SETUP_FAILURE_END}';
+$html = (string) get_config('core', 'additionalhtmltopofbody');
+$html = preg_replace('/' . preg_quote($start, '/') . '.*?' . preg_quote($end, '/') . '/s', '', $html);
+$failure = '${escapePhpSingleQuoted(failure || "")}';
+if ($failure !== '') {
+    $html .= $start
+        . '<div class="alert alert-danger m-0 rounded-0 text-center" role="alert"'
+        . ' style="position:fixed;left:0;right:0;bottom:0;z-index:1100">'
+        . '<strong>Playground warning:</strong> ' . s(rtrim($failure, '. ')) . '.'
+        . ' This site may not match its setup.</div>'
+        . $end;
+}
+set_config('additionalhtmltopofbody', $html);
+echo 'setup-failure-shown';
+`;
+}
+
+async function showSetupFailure(php, failure, publish) {
+  try {
+    const result = await php.run(buildSetupFailurePhp(failure));
+    if (result.text.trim() !== "setup-failure-shown") {
+      throw new Error(result.text.trim().slice(-200) || "no result");
+    }
+  } catch (error) {
+    publish(
+      `Could not ${failure ? "show" : "clear"} the setup warning: ${error.message || error}`,
+      0.95,
+    );
+  }
+}
+
 async function runThemeCssWarmup(php, webRoot) {
   const output = await requestRuntimeScript(
     php,
@@ -3034,6 +3080,10 @@ export async function bootstrapMoodle({
   // True only once the executor ran: if it never starts (e.g. the checkpoint
   // query throws), its login step never ran either, so auto-login must.
   let hasLoginStep = false;
+  // Why the site may not match its setup; shown on every page (see below).
+  // With `strictSetupChecks` in playground.config.json, a reload that did not
+  // restore the setup counts too: for links whose site must match its setup.
+  let setupFailure = null;
   if (blueprint?.steps?.length > 0) {
     try {
       const { executeBlueprint } = await import("../blueprint/executor.js");
@@ -3075,6 +3125,13 @@ export async function bootstrapMoodle({
           `Blueprint failed at step ${result.failedStep}: ${result.error}`,
           0.95,
         );
+        setupFailure = `the setup failed at step ${result.failedStep}: ${result.error}`;
+      } else if (config?.strictSetupChecks === true && checkpoint.legacy) {
+        setupFailure =
+          "this site was saved by an older playground, so its setup was not restored. Use Reset Playground to start again.";
+      } else if (config?.strictSetupChecks === true && checkpoint.changed) {
+        setupFailure =
+          "the setup changed since this site was saved, so it was not applied. Use Reset Playground to apply it.";
       }
       // Surface per-step timing diagnostics (issue #249). A single machine-
       // readable line survives the shell's log prune and lets Playwright /
@@ -3098,7 +3155,9 @@ export async function bootstrapMoodle({
       }
     } catch (blueprintError) {
       publish(`Blueprint execution error: ${blueprintError.message}`, 0.95);
+      setupFailure = `the setup could not run: ${blueprintError.message}`;
     }
+    await showSetupFailure(php, setupFailure, publish);
   }
   // Flush DB checkpoints and saved artifacts before live recovery can snapshot.
   // A failed flush keeps the previous journal intact (it is replaced as a whole),
