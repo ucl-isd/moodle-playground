@@ -3065,6 +3065,10 @@ export async function bootstrapMoodle({
         onPluginInstalled,
         checkpoint,
         dbFile,
+        // For restoreDatabase: a restored database gets the same normalizer and
+        // theme CSS as the boot database.
+        runConfigNormalizer: () => runConfigNormalizer(php, webRoot),
+        runThemeCssWarmup: () => runThemeCssWarmup(php, webRoot),
       });
       hasLoginStep = blueprint.steps.some((s) => s.step === "login");
       if (result.landingPage) {
