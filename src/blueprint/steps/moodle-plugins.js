@@ -321,7 +321,7 @@ async function downloadZip(downloadUrl, publish) {
   }
 }
 
-// The checkpoint remembers the SHA-256 of the archive each step extracted, so a
+// The checkpoint remembers a SHA-256 of the archive each step extracted, so a
 // reload can tell whether the URL still serves that code before running it
 // against the persisted database. Never upgrades on its own.
 // See docs/architecture/adr/ADR-0037-blueprint-archive-hash-verification-on-reload.md.
@@ -341,7 +341,7 @@ async function checkArchiveDrift(
   },
 ) {
   if (!checkpoint?.archives || !Number.isInteger(stepIndex)) return {};
-  const hash = await sha256(zipBytes);
+  const hash = await archiveContentHash(rawEntries, commonPrefix);
   const stored = checkpoint.archives.get(stepIndex);
   if (!restoreOnly || !previouslyCompleted) {
     // First install (or an unfinished step restored on reload): the executor
@@ -350,6 +350,12 @@ async function checkArchiveDrift(
     return {};
   }
   if (stored === hash) return {};
+  if (stored && stored === (await sha256(zipBytes))) {
+    // Checkpoints saved before contents hashes hold the archive's byte hash.
+    checkpoint.archives.set(stepIndex, hash);
+    await checkpoint.save();
+    return {};
+  }
   if (!stored) {
     // Checkpoint written before archive hashes existed: adopt this archive.
     checkpoint.archives.set(stepIndex, hash);
@@ -379,6 +385,23 @@ async function checkArchiveDrift(
   checkpoint.archives.set(stepIndex, hash);
   await checkpoint.save();
   return { clearVersionHash: true };
+}
+
+// Hashes the files inside the archive, not its bytes. GitHub keeps the contents
+// of a commit archive the same, but not its bytes, so a byte hash can change
+// while the code has not. The top-level folder is left out: GitHub names it
+// differently for branch, tag and commit archives of the same code.
+async function archiveContentHash(rawEntries, commonPrefix) {
+  const lines = [];
+  for (const { path, data } of rawEntries) {
+    const relativePath = commonPrefix
+      ? path.substring(commonPrefix.length)
+      : path;
+    if (!relativePath) continue;
+    lines.push(`${relativePath}\t${await sha256(data)}`);
+  }
+  lines.sort();
+  return sha256(new TextEncoder().encode(lines.join("\n")));
 }
 
 function readPluginVersion(rawEntries, commonPrefix) {
@@ -579,6 +602,7 @@ function shouldProxyZipUrl(zipUrl) {
 }
 
 export const __testables = {
+  archiveContentHash,
   detectPluginTypeAndName,
   findCommonPrefix,
   parseGitHubUrl,
