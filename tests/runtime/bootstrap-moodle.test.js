@@ -524,6 +524,24 @@ describe("bootstrapMoodle", () => {
     assert.ok(has(log, /Installed site language pack 'pt'/));
   });
 
+  it("logs the step that halted the blueprint and the earlier failure", async () => {
+    const php = makePhp();
+    const { log } = await boot(php, {
+      blueprint: {
+        steps: [
+          { step: "setLandingPage" },
+          { step: "setLandingPage", critical: true },
+        ],
+      },
+    });
+    assert.ok(
+      has(
+        log,
+        /Blueprint failed at step 2:setLandingPage: setLandingPage: 'path' is required\. \(earlier failure at step 1:setLandingPage: setLandingPage: 'path' is required\.\)/,
+      ),
+    );
+  });
+
   it("serves 5.1+ helper scripts from the public/ web root", async () => {
     const php = makePhp();
     await boot(php, {
