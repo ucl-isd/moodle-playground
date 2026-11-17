@@ -1,0 +1,154 @@
+name: UCL release
+
+# Publishes the UCL playground site from a ucl-v* tag:
+# tests, a fresh build at the chosen Moodle release, UCL's settings, checks,
+# a GitHub release with a checksum and an attestation, then GitHub Pages.
+
+on:
+  push:
+    tags: ["ucl-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ucl-release
+  cancel-in-progress: false
+
+env:
+  # The site's Moodle release. When moving to a new release, change both lines:
+  # the tag, and the commit it points to (the build fails if they disagree).
+  MOODLE_REF: v4.5.16
+  MOODLE_COMMIT: 69ef83ad2948db19595106671f03a1429679c870
+  # The plugin download proxy (moodle-playground-proxy).
+  ADDON_PROXY_URL: https://playground-proxy.preview-moodle.ucl.ac.uk/
+
+jobs:
+  only-our-workflows:
+    name: No other workflow is enabled
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      # Upstream's workflows stay disabled in this fork; one switched back on
+      # (or a new one from an upstream sync) could deploy upstream's site.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          active=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active") | .path')
+          others=$(printf '%s\n' "$active" | grep -v -x -e '.github/workflows/ucl-test.yml' -e '.github/workflows/ucl-release.yml' || true)
+          if [ -n "$others" ]; then
+            echo "Other workflows are enabled; disable them first:"
+            echo "$others"
+            exit 1
+          fi
+          echo "Only our workflows are enabled."
+
+  tests:
+    name: Tests
+    uses: ./.github/workflows/ucl-test.yml
+
+  build:
+    name: Build, check and release
+    needs: [only-our-workflows, tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # the attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/ucl-build-site
+        with:
+          moodle-ref: ${{ env.MOODLE_REF }}
+
+      # Written after the build record, into the copy that is published, so the
+      # build does not count as having uncommitted changes.
+      - name: Write UCL's settings into the site
+        run: node .github/ucl/set-release-config.mjs _site
+
+      - name: Record the release in build-version.json
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const path = "_site/assets/build-version.json";
+            const record = JSON.parse(fs.readFileSync(path, "utf8"));
+            record.release = process.env.GITHUB_REF_NAME;
+            record.moodleRelease = process.env.MOODLE_REF;
+            record.moodleCommit = process.env.MOODLE_COMMIT;
+            fs.writeFileSync(path, JSON.stringify(record, null, 2) + "\n");
+          '
+
+      - name: Check the built site
+        run: node .github/ucl/check-release.mjs built _site
+
+      - name: Package the site
+        run: |
+          set -euo pipefail
+          tar -czf site.tar.gz -C _site .
+          sha256sum site.tar.gz > site.tar.gz.sha256
+
+      - name: Attest the package
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: site.tar.gz
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" site.tar.gz site.tar.gz.sha256 \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Moodle $MOODLE_REF ($MOODLE_COMMIT)."
+
+  deploy:
+    name: Verify and deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+      attestations: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Publish the release package itself, and only once it is shown to be the
+      # one this workflow built from this tag.
+      - name: Verify and unpack the release package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$GITHUB_REF_NAME" --pattern 'site.tar.gz*'
+          sha256sum -c site.tar.gz.sha256
+          gh attestation verify site.tar.gz --repo "$GITHUB_REPOSITORY" \
+            --source-ref "$GITHUB_REF" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ucl-release.yml"
+          mkdir _site
+          tar -xzf site.tar.gz -C _site
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Check the package before publishing
+        run: node .github/ucl/check-release.mjs built _site
+
+      - name: Upload the site for Pages
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+      - name: Check the live site
+        run: node .github/ucl/check-release.mjs live "${{ steps.deployment.outputs.page_url }}"

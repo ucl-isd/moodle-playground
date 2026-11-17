@@ -1,0 +1,74 @@
+name: Build the UCL playground site
+description: >
+  Builds the worker, the Moodle 4.5 bundle at the given release, and assembles the site in _site.
+  Shared by ucl-test.yml and ucl-release.yml.
+
+inputs:
+  moodle-ref:
+    description: The Moodle release to build from, as a moodle/moodle tag (for example v4.5.16).
+    required: true
+  build-version:
+    description: The Playground Build ID to record (optional).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 24
+        cache: npm
+
+    - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+      with:
+        php-version: "8.3"
+        extensions: pdo_sqlite, sqlite3, intl, gd, zip
+
+    - name: Install dependencies
+      shell: bash
+      run: npm ci
+
+    - name: Generate build metadata
+      shell: bash
+      env:
+        BUILD_VERSION: ${{ inputs.build-version }}
+      run: npm run build:version
+
+    - name: Build the worker
+      shell: bash
+      run: npm run build-worker
+
+    # Built fresh every time, never from a cache: a cached bundle would skip the
+    # chosen Moodle release, and the SQLite fix is applied while building it.
+    - name: Build the Moodle 4.5 bundle
+      shell: bash
+      env:
+        GIT_REF: ${{ inputs.moodle-ref }}
+      run: |
+        set -euo pipefail
+        rm -rf assets/moodle/MOODLE_405_STABLE assets/manifests/MOODLE_405_STABLE.json
+        make check-php
+        make bundle-MOODLE_405_STABLE
+
+    - name: Assemble the site
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf _site
+        mkdir -p _site
+        rsync -a ./ ./_site/ \
+          --exclude ".git/" \
+          --exclude ".github/" \
+          --exclude ".agents/" \
+          --exclude ".claude/" \
+          --exclude ".venv/" \
+          --exclude ".cache/" \
+          --exclude "_site/" \
+          --exclude "docs/" \
+          --exclude "node_modules/" \
+          --exclude "site/" \
+          --exclude "tests/" \
+          --exclude "patches/"
+        touch _site/.nojekyll
+        node scripts/chunk-bundles.mjs _site
