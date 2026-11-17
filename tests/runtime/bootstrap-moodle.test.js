@@ -5,6 +5,7 @@ import { createUstarTar } from "../../scripts/lib/tar-ustar.mjs";
 import {
   bootstrapMoodle,
   startArchiveResolution,
+  summariseError,
 } from "../../src/runtime/bootstrap.js";
 
 const enc = (s) => new TextEncoder().encode(s);
@@ -82,6 +83,7 @@ function makePhp({ run = {}, request = {}, files = {} } = {}) {
       dirs.add("/persist/moodledata/localcache/theme");
       return `notice\n${json({ ok: true, entries: 3, rewritten: 1 })}`;
     },
+    "playground-setup-failure": () => "setup-failure-shown",
     "set_config('lang'": () =>
       json({ ok: true, lang: "es", action: "applied", previous: "en" }),
     lang_installer: () => json({ ok: true, lang: "en", action: "skipped" }),
@@ -175,6 +177,93 @@ function boot(php, overrides = {}) {
 const INSTALL_STATE =
   "/persist/config/moodle-playground-install-s_1-php83_moodle50.json";
 const has = (log, re) => log.some((line) => re.test(line));
+
+// The failure message the last boot wrote into the red bar ("" = cleared), or
+// undefined when the bar script never ran.
+function setupBar(php) {
+  const code = php.runs
+    .filter((c) => c.includes("playground-setup-failure"))
+    .at(-1);
+  if (!code) return undefined;
+  return code.match(/\$failure = '((?:[^'\\]|\\.)*)';/)[1];
+}
+
+const STRICT = { ...CONFIG, strictSetupChecks: true };
+
+// A reload of an installed snapshot site whose stored checkpoint is `stored`.
+function reloadPhp(stored) {
+  return makePhp({
+    files: {
+      [INSTALL_STATE]: json({
+        runtimeId: "php83-moodle50",
+        bundleVersion: "b1",
+        release: makeArchive().manifest.release,
+        sha256: "abc",
+        dbName: "moodle_s_1_php83_moodle50",
+        installed: true,
+        source: "cli",
+      }),
+    },
+    run: {
+      "SELECT value FROM mdl_config WHERE name = 'playground_blueprint_checkpoint'":
+        () => json(stored),
+    },
+  });
+}
+
+// The red bar shows one line of an error; the log keeps all of it.
+describe("summariseError", () => {
+  it("picks Moodle's command-line error line", () => {
+    assert.equal(
+      summariseError(
+        "PHP.run() failed with exit code 1. === Stdout === -->editor_atto\n++ Success ++\n" +
+          "!!! Cannot downgrade mod_coursework from 2026081103 to 2026070600. !!!\n!! Stack trace !!",
+      ),
+      "Cannot downgrade mod_coursework from 2026081103 to 2026070600.",
+    );
+  });
+
+  it("picks the exception handler's message, without its debug part", () => {
+    assert.equal(
+      summariseError(
+        "PHP.run() failed with exit code 255. === Stderr === Default exception handler: " +
+          "Coding error detected, it must be fixed by a programmer: Invalid field Debug: more\n* line 308",
+      ),
+      "Coding error detected, it must be fixed by a programmer: Invalid field",
+    );
+  });
+
+  it("picks a coding error line on its own", () => {
+    assert.equal(
+      summariseError(
+        "noise\nCoding error detected, it must be fixed by a programmer: x\nmore",
+      ),
+      "Coding error detected, it must be fixed by a programmer: x",
+    );
+  });
+
+  it("drops the output dump of an error with no Moodle error line", () => {
+    assert.equal(
+      summariseError(
+        "PHP.run() failed with exit code 1. === Stdout === lots of output",
+      ),
+      "PHP.run() failed with exit code 1.",
+    );
+  });
+
+  it("leaves a short message as it is", () => {
+    assert.equal(
+      summariseError("setLandingPage: 'path' is required."),
+      "setLandingPage: 'path' is required.",
+    );
+  });
+
+  it("caps the length at 300 characters", () => {
+    const line = summariseError("x".repeat(500));
+    assert.equal(line.length, 300);
+    assert.ok(line.endsWith("…"));
+  });
+});
 
 describe("bootstrapMoodle", () => {
   it("installs a fresh site through the CLI stages, patches core and auto-logs in", async () => {
@@ -540,6 +629,176 @@ describe("bootstrapMoodle", () => {
         /Blueprint failed at step 2:setLandingPage: setLandingPage: 'path' is required\. \(earlier failure at step 1:setLandingPage: setLandingPage: 'path' is required\.\)/,
       ),
     );
+  });
+
+  // A failed setup is shown on every Moodle page, reload included, as a red
+  // bar; a boot whose setup succeeds clears it.
+  describe("setup failure bar", () => {
+    it("names the failed step and its error", async () => {
+      const php = makePhp();
+      await boot(php, {
+        blueprint: { steps: [{ step: "setLandingPage" }] },
+      });
+      assert.equal(
+        setupBar(php),
+        "the setup failed at step 1:setLandingPage: setLandingPage: \\'path\\' is required.",
+      );
+      const code = php.runs.find((c) => c.includes("playground-setup-failure"));
+      assert.match(code, /alert alert-danger/);
+      assert.match(code, /position:fixed;left:0;right:0;bottom:0/);
+      // Escaped with Moodle's s(), one full stop before the last sentence.
+      assert.match(code, /s\(rtrim\(\$failure, '\. '\)\) \. '\.'/);
+    });
+
+    it("is cleared by a boot whose setup succeeds", async () => {
+      const php = makePhp();
+      await boot(php, {
+        blueprint: { steps: [{ step: "setLandingPage", path: "/my/" }] },
+      });
+      assert.equal(setupBar(php), "");
+    });
+
+    it("is not written when there is no setup", async () => {
+      const php = makePhp();
+      await boot(php);
+      assert.equal(setupBar(php), undefined);
+    });
+
+    it("with strictSetupChecks, shows a reload whose setup changed since the site was saved", async () => {
+      const php = reloadPhp({
+        version: 1,
+        fingerprint: "older",
+        completed: [0],
+      });
+      const { log } = await boot(php, {
+        config: STRICT,
+        blueprint: { steps: [{ step: "setLandingPage", path: "/my/" }] },
+      });
+      assert.ok(has(log, /The blueprint changed since this instance/));
+      assert.match(
+        setupBar(php),
+        /^the setup changed since this site was saved/,
+      );
+    });
+
+    it("with strictSetupChecks, shows a reload of a site saved before checkpoints existed", async () => {
+      const php = reloadPhp(null);
+      await boot(php, {
+        config: STRICT,
+        blueprint: { steps: [{ step: "setLandingPage", path: "/my/" }] },
+      });
+      assert.match(
+        setupBar(php),
+        /^this site was saved by an older playground/,
+      );
+    });
+
+    it("without strictSetupChecks, a changed or older saved setup only logs, as before", async () => {
+      for (const stored of [
+        { version: 1, fingerprint: "older", completed: [0] },
+        null,
+      ]) {
+        const php = reloadPhp(stored);
+        await boot(php, {
+          blueprint: { steps: [{ step: "setLandingPage", path: "/my/" }] },
+        });
+        assert.equal(setupBar(php), "", JSON.stringify(stored));
+      }
+    });
+
+    it("shows a setup that stopped with an error", async () => {
+      // The first checkpoint save (before any step) works; the save after the
+      // step fails, and the executor turns that into an error on purpose.
+      let saves = 0;
+      const php = makePhp({
+        run: {
+          "'playground_blueprint_checkpoint', :value": () =>
+            ++saves === 1 ? "checkpoint-saved" : "disk full",
+        },
+      });
+      const { log } = await boot(php, {
+        blueprint: { steps: [{ step: "setLandingPage", path: "/my/" }] },
+      });
+      assert.ok(
+        has(
+          log,
+          /Blueprint execution error: Blueprint checkpoint could not be saved/,
+        ),
+      );
+      assert.match(
+        setupBar(php),
+        /^the setup could not run: Blueprint checkpoint could not be saved/,
+      );
+    });
+
+    it("shows the useful line of a long error, not the whole output", async () => {
+      // What the PHP runner throws when Moodle's upgrade refuses a downgrade.
+      const upgradeOutput =
+        "PHP.run() failed with exit code 1. === Stdout === -->editor_atto\n" +
+        "++ Success (0.02 seconds) ++\n" +
+        "!!! Cannot downgrade mod_coursework from 2026081103 to 2026070600. !!!\n" +
+        "Error code: cannotdowngrade";
+      const php = makePhp({
+        run: {
+          "UPGRADE-REFUSED": () => {
+            throw new Error(upgradeOutput);
+          },
+        },
+      });
+      const { log } = await boot(php, {
+        blueprint: {
+          steps: [{ step: "runPhpCode", code: "<?php // UPGRADE-REFUSED" }],
+        },
+      });
+      assert.equal(
+        setupBar(php),
+        "the setup failed at step 1:runPhpCode: Cannot downgrade mod_coursework from 2026081103 to 2026070600.",
+      );
+      // The log keeps the whole error.
+      assert.ok(
+        has(
+          log,
+          /Blueprint failed at step 1:runPhpCode: PHP\.run\(\) failed .*editor_atto/s,
+        ),
+      );
+    });
+
+    it("shows the useful line when the setup cannot run at all", async () => {
+      // On a reload the checkpoint lookup runs inside the setup; here it fails.
+      const php = reloadPhp(null);
+      const lookup =
+        "SELECT value FROM mdl_config WHERE name = 'playground_blueprint_checkpoint'";
+      const original = php.run;
+      php.run = async (code) => {
+        if (
+          code.includes(lookup) &&
+          !code.includes("playground-setup-failure")
+        ) {
+          throw new Error(
+            "PHP.run() failed with exit code 255. === Stdout === a\nb\n!!! Database is locked !!!\nmore",
+          );
+        }
+        return original(code);
+      };
+      await boot(php, {
+        blueprint: { steps: [{ step: "setLandingPage", path: "/my/" }] },
+      });
+      assert.equal(
+        setupBar(php),
+        "the setup could not run: Database is locked",
+      );
+    });
+
+    it("does not stop the boot when the bar cannot be written", async () => {
+      const php = makePhp({
+        run: { "playground-setup-failure": () => "Fatal error" },
+      });
+      const { result, log } = await boot(php, {
+        blueprint: { steps: [{ step: "setLandingPage" }] },
+      });
+      assert.ok(result.readyPath);
+      assert.ok(has(log, /Could not show the setup warning: Fatal error/));
+    });
   });
 
   it("serves 5.1+ helper scripts from the public/ web root", async () => {

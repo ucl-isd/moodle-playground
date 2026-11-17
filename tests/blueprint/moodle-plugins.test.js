@@ -263,6 +263,53 @@ it("reload with an older archive than the persisted DB warns and does not extrac
   assert.ok(fixture.messages.some((m) => /changed since/.test(m)));
 });
 
+// strictSetupChecks: for links whose site must match its setup.
+it("with strictSetupChecks, a changed archive fails the step instead of skipping it", async () => {
+  const installed = pluginZip(2026101600);
+  const changed = pluginZip(2026101600, { "lib.php": "<?php // edited" });
+  const fixture = reloadContext({
+    archives: new Map([[3, sha256Hex(installed)]]),
+  });
+  fixture.context.config = { strictSetupChecks: true };
+  await serving(changed, () =>
+    assert.rejects(
+      getStepHandler("installMoodlePlugin")(STEP, fixture.context),
+      /local_drift: the archive at https:\/\/example\.invalid\/plugin\.zip changed since it was installed \(archive version 2026101600, installed 2026101600\)/,
+    ),
+  );
+  assert.deepEqual(fixture.files, []);
+  assert.equal(fixture.saves(), 0);
+});
+
+it("with strictSetupChecks off, a changed archive is skipped as before", async () => {
+  const installed = pluginZip(2026101600);
+  const changed = pluginZip(2026101600, { "lib.php": "<?php // edited" });
+  const fixture = reloadContext({
+    archives: new Map([[3, sha256Hex(installed)]]),
+  });
+  fixture.context.config = { strictSetupChecks: false };
+  let result;
+  await serving(changed, async () => {
+    result = await getStepHandler("installMoodlePlugin")(STEP, fixture.context);
+  });
+  assert.deepEqual(result, { skipped: true });
+});
+
+it("with strictSetupChecks, a plugin the reviewer uninstalled is still skipped", async () => {
+  const fixture = reloadContext({
+    archives: new Map([[3, sha256Hex(pluginZip(2026101600))]]),
+    // No version row in the database: the plugin was uninstalled.
+    installedVersion: false,
+  });
+  fixture.context.config = { strictSetupChecks: true };
+  const result = await getStepHandler("installMoodlePlugin")(
+    STEP,
+    fixture.context,
+  );
+  assert.deepEqual(result, { skipped: true });
+  assert.deepEqual(fixture.files, []);
+});
+
 it("reload with a newer archive installs it, warns and makes Moodle ask for the upgrade", async () => {
   const newer = pluginZip(2026101601);
   const archives = new Map([[3, contentHash(pluginZip(2026101600))]]);
