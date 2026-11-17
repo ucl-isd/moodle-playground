@@ -50,7 +50,7 @@ class sqlite_sql_generator extends sql_generator {
     public $enum_inline_code = true;
     public $enum_extra_code = false;
 
-    public $drop_index_sql = 'ALTER TABLE TABLENAME DROP INDEX INDEXNAME';
+    public $drop_index_sql = 'DROP INDEX INDEXNAME';
 
     public $rename_index_sql = null;
     public $rename_key_sql = null;
@@ -252,6 +252,12 @@ class sqlite_sql_generator extends sql_generator {
         if ($xmldb_add_field) {
             $xmldb_table->addField($xmldb_add_field);
         }
+
+        // Dropping the table drops its indexes, and the caller's table object
+        // rarely describes them. Re-declare every live index the caller did not
+        // describe, so the rebuilt table has the same indexes as before.
+        $this->add_live_indexes($xmldb_table);
+
         if ($oldname) {
             $indexes = $xmldb_table->getIndexes();
             foreach ($indexes as $index) {
@@ -308,34 +314,65 @@ class sqlite_sql_generator extends sql_generator {
             $xmldb_table->addKey(new xmldb_key('primary', XMLDB_KEY_PRIMARY, $pkcolumns));
         }
 
-        // Build the data-copy SELECT list. It must reference ONLY columns that
-        // physically exist in temp_data (the pre-change table). Columns in the
-        // recreated schema that are absent from temp_data (genuinely new fields)
-        // are populated with NULL so SQLite applies their column default.
-        $fields = $xmldb_table->getFields();
-        foreach ($fields as $key => $field) {
+        // Copy back only the columns temp_data has. A new column is left out of
+        // the INSERT, so SQLite fills it with its default. Selecting NULL for it
+        // instead fails on a NOT NULL column, because an explicit NULL is not
+        // replaced by the default.
+        $targets = array();
+        $sources = array();
+        foreach ($xmldb_table->getFields() as $field) {
             $fieldname = $field->getName();
             if ($fieldname == $newname && $oldname && $oldname != $newname) {
-                // Renamed field: the data still lives under the old column name
-                // in temp_data, so copy it across to the new name.
-                $fields[$key] = $this->getEncQuoted($oldname) . ' AS ' . $this->getEncQuoted($newname);
-            } else if (!isset($existingcolumns[strtolower($fieldname)])) {
-                // Brand-new column not present in temp_data: select NULL so the
-                // recreated table falls back to the column default for this field.
-                $fields[$key] = 'NULL AS ' . $this->getEncQuoted($fieldname);
-            } else {
-                $fields[$key] = $this->getEncQuoted($fieldname);
+                // Renamed field: the data is still under the old name in temp_data.
+                $targets[] = $this->getEncQuoted($newname);
+                $sources[] = $this->getEncQuoted($oldname);
+            } else if (isset($existingcolumns[strtolower($fieldname)])) {
+                $targets[] = $this->getEncQuoted($fieldname);
+                $sources[] = $this->getEncQuoted($fieldname);
             }
         }
-        $fields = implode(',', $fields);
         $results[] = 'BEGIN TRANSACTION';
         $results[] = 'CREATE TEMPORARY TABLE temp_data AS SELECT * FROM ' . $tablename;
         $results[] = 'DROP TABLE ' . $tablename;
         $results = array_merge($results, $this->getCreateTableSQL($xmldb_table));
-        $results[] = 'INSERT INTO ' . $tablename . ' SELECT ' . $fields . ' FROM temp_data';
+        $results[] = 'INSERT INTO ' . $tablename . ' (' . implode(',', $targets) . ')'
+            . ' SELECT ' . implode(',', $sources) . ' FROM temp_data';
         $results[] = 'DROP TABLE temp_data';
         $results[] = 'COMMIT';
         return $results;
+    }
+
+    /**
+     * Add the table's live indexes to $xmldb_table, unless an index or key the
+     * caller described already covers the same columns.
+     *
+     * SQLite's automatic indexes (sqlite_autoindex_*) are skipped. They belong to a
+     * PRIMARY KEY or UNIQUE constraint and come back with the constraint.
+     *
+     * @param xmldb_table $xmldb_table
+     */
+    protected function add_live_indexes($xmldb_table) {
+        $described = array();
+        foreach ($xmldb_table->getIndexes() as $index) {
+            $described[] = strtolower(implode(',', $index->getFields()));
+        }
+        foreach ($xmldb_table->getKeys() as $key) {
+            if ($key->getType() != XMLDB_KEY_PRIMARY) {
+                $described[] = strtolower(implode(',', $key->getFields()));
+            }
+        }
+
+        $count = 0;
+        foreach ($this->mdb->get_indexes($xmldb_table->getName()) as $indexname => $liveindex) {
+            if (strpos($indexname, 'sqlite_autoindex') === 0) {
+                continue;
+            }
+            if (in_array(implode(',', $liveindex['columns']), $described)) {
+                continue;
+            }
+            $type = $liveindex['unique'] ? XMLDB_INDEX_UNIQUE : XMLDB_INDEX_NOTUNIQUE;
+            $xmldb_table->addIndex(new xmldb_index('liveindex' . ++$count, $type, $liveindex['columns']));
+        }
     }
 
     /**
@@ -380,6 +417,10 @@ class sqlite_sql_generator extends sql_generator {
         if ($type !== XMLDB_TYPE_TEXT && $type !== XMLDB_TYPE_BINARY) {
             if (!empty($column->max_length)) {
                 $field->setLength($column->max_length);
+            } else if ($type === XMLDB_TYPE_INTEGER) {
+                // An INTEGER PRIMARY KEY column has no length in SQLite, and an
+                // integer field without one is refused. 10 is the length of id.
+                $field->setLength(10);
             }
             if ($type === XMLDB_TYPE_NUMBER && !empty($column->scale)) {
                 $field->setDecimals($column->scale);
@@ -404,6 +445,11 @@ class sqlite_sql_generator extends sql_generator {
     }
 
     public function getAddKeySQL($xmldb_table, $xmldb_key) {
+        if ($xmldb_key->getType() != XMLDB_KEY_PRIMARY) {
+            // SQLite has no unique or foreign key constraints here, only their
+            // indexes, and those need no rebuild.
+            return parent::getAddKeySQL($xmldb_table, $xmldb_key);
+        }
         $xmldb_table->addKey($xmldb_key);
         return $this->getAlterTableSchema($xmldb_table);
     }
@@ -442,11 +488,6 @@ class sqlite_sql_generator extends sql_generator {
         return $this->getAlterTableSchema($xmldb_table, $xmldb_field);
     }
 
-    public function getAddIndexSQL($xmldb_table, $xmldb_index) {
-        $xmldb_table->addIndex($xmldb_index);
-        return $this->getAlterTableSchema($xmldb_table);
-    }
-
     public function getRenameIndexSQL($xmldb_table, $xmldb_index, $newname) {
         $dbindexname = $this->mdb->get_manager()->find_index_name($xmldb_table, $xmldb_index);
         $xmldb_index->setName($newname);
@@ -466,12 +507,11 @@ class sqlite_sql_generator extends sql_generator {
         return $this->getAlterTableSchema($xmldb_table, null, $xmldb_field);
     }
 
-    public function getDropIndexSQL($xmldb_table, $xmldb_index) {
-        $xmldb_table->deleteIndex($xmldb_index->getName());
-        return $this->getAlterTableSchema($xmldb_table);
-    }
-
     public function getDropKeySQL($xmldb_table, $xmldb_key) {
+        if ($xmldb_key->getType() != XMLDB_KEY_PRIMARY) {
+            // Drops the key's index only, see getAddKeySQL().
+            return parent::getDropKeySQL($xmldb_table, $xmldb_key);
+        }
         $xmldb_table->deleteKey($xmldb_key->getName());
         return $this->getAlterTableSchema($xmldb_table);
     }
