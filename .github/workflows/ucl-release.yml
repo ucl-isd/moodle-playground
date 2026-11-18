@@ -36,8 +36,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # GitHub's own workflows (dependency graph, Dependabot) are listed under dynamic/.
           active=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" --paginate \
-            --jq '.workflows[] | select(.state == "active") | .path')
+            --jq '.workflows[] | select(.state == "active") | .path | select(startswith("dynamic/") | not)')
           others=$(printf '%s\n' "$active" | grep -v -x -e '.github/workflows/ucl-test.yml' -e '.github/workflows/ucl-release.yml' || true)
           if [ -n "$others" ]; then
             echo "Other workflows are enabled; disable them first:"
